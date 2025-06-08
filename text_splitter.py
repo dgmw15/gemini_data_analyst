@@ -2,42 +2,23 @@ import polars as pl
 import math
 from tqdm import tqdm
 
-def chunk_polars_dataframe(df: pl.DataFrame, chunk_size: int = 100) -> list[pl.DataFrame]:
+def chunk_polars_dataframe(df: pl.DataFrame, chunk_size: int) -> list[pl.DataFrame]:
     """
-    Splits a Polars DataFrame into chunks without duplication.
+    Split a Polars DataFrame into chunks of specified size.
     
-    Args:
-        df (pl.DataFrame): The DataFrame to split into chunks
-        chunk_size (int): Number of rows per chunk (default: 100)
-    
-    Returns:
+    Input:
+        df (pl.DataFrame): The DataFrame to split
+        chunk_size (int): Number of rows per chunk
+    Output:
         list[pl.DataFrame]: List of DataFrame chunks
     """
-    if df is None or len(df) == 0:
-        print("Warning: Empty or None DataFrame provided")
-        return []
-
-    total_rows = len(df)
-    num_chunks = math.ceil(total_rows / chunk_size)
     chunks = []
-
-    print(f"Total rows: {total_rows}")
-    print(f"Chunk size: {chunk_size}")
-    print(f"Expected number of chunks: {num_chunks}")
-
-    for i in range(num_chunks):
-        start_idx = i * chunk_size
-        end_idx = min((i + 1) * chunk_size, total_rows)
-        
-        # Create chunk and ensure columns are preserved
-        chunk = df.slice(start_idx, end_idx - start_idx)
-        chunk = chunk.select(df.columns)
-        
-        if len(chunk) > 0:
-            chunks.append(chunk)
-            print(f"Created chunk {i+1} with {len(chunk)} rows")
-
-    print(f"Actually created {len(chunks)} chunks")
+    total_rows = len(df)
+    
+    for i in range(0, total_rows, chunk_size):
+        chunk = df[i:i + chunk_size]
+        chunks.append(chunk)
+    
     return chunks
 
 def combine_dataframes_loop(dataframes: list[pl.DataFrame]) -> pl.DataFrame:

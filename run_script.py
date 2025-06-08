@@ -54,7 +54,7 @@ default_output_dir = r"C:\Users\pauld\Desktop\Output for AI QC"
 
 # 🎯 PROCESSING SELECTION:
 # Choose which prompt and input file to use for processing:
-# Available prompts: material_system_instruction, dimensions_system_instruction, oryx_processing_instruction
+# Import the prompts you want to use
 prompt = oryx_processing_instruction  # 👈 CHANGE THIS: Select your prompt
 input_file = dimensions_file  # 👈 CHANGE THIS: Select your input file
 
@@ -64,7 +64,7 @@ input_file = dimensions_file  # 👈 CHANGE THIS: Select your input file
 # Vertex AI: Can usually handle higher rates, but 4/min is conservative
 REQUESTS_PER_WINDOW = 4  # Number of requests allowed
 TIME_WINDOW = 60  # Time window in seconds (1 minute)
-REQUEST_INTERVAL = TIME_WINDOW / REQUESTS_PER_WINDOW  # Calculated: 15 seconds between requests
+REQUEST_INTERVAL = TIME_WINDOW / REQUESTS_PER_WINDOW
 
 # 📊 DATA PROCESSING CONFIGURATION:
 # Controls how data is split into chunks for processing
@@ -135,7 +135,7 @@ print(f"Data split into {len(df_chunks)} chunks")
 
 async def process_chunk(chunk, data_processor, prompt, chunk_index):
     """
-    Process a single chunk asynchronously with rate limiting and token validation.
+    Process a single chunk asynchronously with rate limiting and automatic token size reduction.
     
     Input:
         chunk: DataFrame chunk with rows
@@ -147,6 +147,7 @@ async def process_chunk(chunk, data_processor, prompt, chunk_index):
     Process:
         - Converts the chunk to JSON
         - Validates token count before API call
+        - If token limit exceeded, automatically reduces chunk size and processes sub-chunks
         - Sends to AI model asynchronously with rate limiting
         - Cleans response and converts back to DataFrame
     """
@@ -158,36 +159,95 @@ async def process_chunk(chunk, data_processor, prompt, chunk_index):
         api_type = "Vertex AI" if data_processor.use_vertex_ai else "Gemini"
         print(f"Chunk {chunk_index}: JSON prepared, using {api_type}")
         
-        # Apply rate limiting
-        async with rate_limiter:
-            print(f"Chunk {chunk_index}: Sending to {api_type} API...")
-            # Add delay to ensure we don't exceed rate limit
-            await asyncio.sleep(REQUEST_INTERVAL)
+        # 🔍 CHECK TOKEN LIMITS AND AUTO-REDUCE IF NEEDED
+        current_chunk_size = len(chunk)
+        is_valid, token_count, safe_limit = data_processor.validate_content_tokens(chunk_json, current_chunk_size)
+        
+        if not is_valid:
+            print(f"🔄 Chunk {chunk_index}: Token limit exceeded, auto-reducing chunk size...")
             
-            # Get AI response asynchronously (includes automatic token validation)
-            ai_response = await data_processor.ai_api_response_async(chunk_json, prompt, CHUNK_SIZE)
-            print(f"Chunk {chunk_index}: {api_type} API response received")
-        
-        # Clean AI response
-        ai_response_str = data_processor.response_data_cleansed(ai_response)
-        
-        # Convert JSON response to DataFrame
-        json_output = json.loads(ai_response_str)
-        df_output = pl.DataFrame(json_output)
+            # Calculate optimal chunk size
+            optimal_size = data_processor.calculate_optimal_chunk_size(current_chunk_size, token_count, safe_limit)
+            
+            # Split chunk into smaller sub-chunks
+            sub_chunks = data_processor.split_chunk_intelligently(chunk, optimal_size)
+            
+            print(f"🔄 Chunk {chunk_index}: Processing {len(sub_chunks)} sub-chunks...")
+            
+            # Process each sub-chunk
+            all_sub_results = []
+            for i, sub_chunk in enumerate(sub_chunks):
+                print(f"   📦 Processing sub-chunk {chunk_index}.{i+1} ({len(sub_chunk)} rows)...")
+                
+                # Apply rate limiting for each sub-chunk
+                async with rate_limiter:
+                    # Convert sub-chunk to JSON
+                    sub_chunk_json = data_processor.convert_to_json_string(sub_chunk)
+                    
+                    print(f"   📦 Sub-chunk {chunk_index}.{i+1}: Sending to {api_type} API...")
+                    # Add delay to ensure we don't exceed rate limit
+                    await asyncio.sleep(REQUEST_INTERVAL)
+                    
+                    # Get AI response for sub-chunk (no need to re-validate tokens)
+                    ai_response = await data_processor.ai_api_response_async(sub_chunk_json, prompt, None)
+                    print(f"   📦 Sub-chunk {chunk_index}.{i+1}: {api_type} API response received")
+                
+                # Clean AI response
+                ai_response_str = data_processor.response_data_cleansed(ai_response)
+                
+                # Convert JSON response to DataFrame
+                json_output = json.loads(ai_response_str)
+                df_output = pl.DataFrame(json_output)
+                
+                # Format DataFrame types
+                df_output = data_processor.imposed_string_format(df_output)
+                all_sub_results.append(df_output)
+                
+                print(f"   ✅ Sub-chunk {chunk_index}.{i+1}: Processed ({df_output.shape[0]} rows)")
+            
+            # Combine all sub-chunk results
+            combined_df = pl.concat(all_sub_results, how="vertical") if all_sub_results else pl.DataFrame()
+            
+            # Calculate and display chunk processing time
+            chunk_end_time = time.time()
+            chunk_elapsed_time = chunk_end_time - chunk_start_time
+            print(f"Chunk {chunk_index}: {format_elapsed_time(chunk_elapsed_time)} (auto-reduced)")
+            print(f"Chunk {chunk_index}: Final processed DataFrame shape: {combined_df.shape}")
+            
+            return combined_df
+            
+        else:
+            # ✅ NORMAL PROCESSING - TOKEN LIMITS OK
+            print(f"✅ Chunk {chunk_index}: Token validation passed, proceeding normally...")
+            
+            # Apply rate limiting
+            async with rate_limiter:
+                print(f"Chunk {chunk_index}: Sending to {api_type} API...")
+                # Add delay to ensure we don't exceed rate limit
+                await asyncio.sleep(REQUEST_INTERVAL)
+                
+                # Get AI response asynchronously (token validation already done)
+                ai_response = await data_processor.ai_api_response_async(chunk_json, prompt, None)
+                print(f"Chunk {chunk_index}: {api_type} API response received")
+            
+            # Clean AI response
+            ai_response_str = data_processor.response_data_cleansed(ai_response)
+            
+            # Convert JSON response to DataFrame
+            json_output = json.loads(ai_response_str)
+            df_output = pl.DataFrame(json_output)
 
-        # Format DataFrame types
-        df_output = data_processor.imposed_string_format(df_output)
-        
-        # Calculate and display chunk processing time
-        chunk_end_time = time.time()
-        chunk_elapsed_time = chunk_end_time - chunk_start_time
-        print(f"Chunk {chunk_index}: {format_elapsed_time(chunk_elapsed_time)}")
-        print(f"Chunk {chunk_index}: Processed DataFrame shape: {df_output.shape}")
-        
-        return df_output
-    except SystemExit:
-        # Re-raise SystemExit to stop processing
-        raise
+            # Format DataFrame types
+            df_output = data_processor.imposed_string_format(df_output)
+            
+            # Calculate and display chunk processing time
+            chunk_end_time = time.time()
+            chunk_elapsed_time = chunk_end_time - chunk_start_time
+            print(f"Chunk {chunk_index}: {format_elapsed_time(chunk_elapsed_time)}")
+            print(f"Chunk {chunk_index}: Processed DataFrame shape: {df_output.shape}")
+            
+            return df_output
+            
     except Exception as e:
         print(f"Error processing chunk {chunk_index}: {e}")
         return None

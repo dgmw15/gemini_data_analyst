@@ -218,50 +218,7 @@ class data_processing_pipeline:
         
         return is_valid, token_count, safe_limit
 
-    def stop_processing_due_to_token_limit(self, token_count: int, safe_limit: int, current_chunk_size: int):
-        """
-        🛑 Stop processing and provide guidance when token limits are exceeded.
-        
-        Input:
-            token_count (int): Current token count that exceeded the limit
-            safe_limit (int): Maximum safe token limit
-            current_chunk_size (int): Current chunk size being used
-        Output:
-            None (raises SystemExit to stop execution)
-        """
-        excess_tokens = token_count - safe_limit
-        excess_percentage = (excess_tokens / safe_limit) * 100
-        
-        print("\n" + "="*60)
-        print("🚨 TOKEN LIMIT EXCEEDED - PROCESSING STOPPED")
-        print("="*60)
-        print(f"📊 Current token count: {token_count:,}")
-        print(f"🛡️ Safe token limit: {safe_limit:,}")
-        print(f"⚠️  Excess tokens: {excess_tokens:,} ({excess_percentage:.1f}% over limit)")
-        print(f"📦 Current chunk size: {current_chunk_size} rows")
-        
-        # Suggest new chunk size
-        reduction_factor = token_count / safe_limit
-        suggested_chunk_size = max(1, int(current_chunk_size / reduction_factor * 0.9))  # 90% of calculated size for safety
-        
-        print("\n💡 RECOMMENDED ACTIONS:")
-        print(f"1. Reduce CHUNK_SIZE from {current_chunk_size} to {suggested_chunk_size} rows")
-        print("2. Edit the CHUNK_SIZE variable in your run_script.py configuration section")
-        print("3. Re-run the script with the smaller chunk size")
-        
-        print("\n🔧 CONFIGURATION EDIT:")
-        print(f"   Change: CHUNK_SIZE = {current_chunk_size}")
-        print(f"   To:     CHUNK_SIZE = {suggested_chunk_size}")
-        
-        print("\n📝 ALTERNATIVE OPTIONS:")
-        print("- Use a model with higher token limits")
-        print("- Reduce the amount of data in each row")
-        print("- Process data in smaller batches")
-        print("="*60)
-        
-        raise SystemExit("❌ Processing stopped due to token limit exceeded. Please adjust CHUNK_SIZE and try again.")
-
-    def validate_content_tokens(self, content: str, current_chunk_size: int) -> bool:
+    def validate_content_tokens(self, content: str, current_chunk_size: int) -> tuple[bool, int, int]:
         """
         🔍 Validate that content doesn't exceed safe token limits before API call.
         
@@ -269,59 +226,93 @@ class data_processing_pipeline:
             content (str): The content to validate
             current_chunk_size (int): Current chunk size for error reporting
         Output:
-            bool: True if content is safe to send, False if it exceeds limits
+            tuple[bool, int, int]: (is_valid, token_count, safe_limit)
+                - is_valid: True if content is safe to send
+                - token_count: Actual token count of content
+                - safe_limit: Maximum safe token limit
         Process:
             - Counts tokens using Gemini's SDK
             - Validates against 50% of model's output token limit
-            - Stops processing if limit exceeded
+            - Returns validation result instead of stopping
         """
         try:
             print(f"🔍 Validating token count for content...")
             is_valid, token_count, safe_limit = self.validate_token_limit(content)
             
             if not is_valid:
-                self.stop_processing_due_to_token_limit(token_count, safe_limit, current_chunk_size)
-                return False
+                print(f"⚠️ Content exceeds token limit, will attempt automatic reduction")
+                return False, token_count, safe_limit
             
-            return True
-        except SystemExit:
-            # Re-raise SystemExit to stop processing
-            raise
+            return True, token_count, safe_limit
         except Exception as e:
             print(f"⚠️ Warning: Could not validate token count: {e}")
             print("🔄 Proceeding with API call (token validation failed)")
-            return True
+            return True, 0, 0
+
+    def calculate_optimal_chunk_size(self, current_chunk_size: int, token_count: int, safe_limit: int) -> int:
+        """
+        🧮 Calculate optimal chunk size based on token count exceeded.
+        
+        Input:
+            current_chunk_size (int): Current chunk size that exceeded limits
+            token_count (int): Current token count
+            safe_limit (int): Maximum safe token limit
+        Output:
+            int: Suggested new chunk size (minimum 1)
+        """
+        if token_count <= safe_limit:
+            return current_chunk_size
+        
+        # Calculate reduction factor with safety margin
+        reduction_factor = safe_limit / token_count
+        suggested_size = max(1, int(current_chunk_size * reduction_factor * 0.8))  # 80% for safety
+        
+        print(f"📊 Token reduction calculation:")
+        print(f"   Current chunk size: {current_chunk_size}")
+        print(f"   Token count: {token_count:,}")
+        print(f"   Safe limit: {safe_limit:,}")
+        print(f"   Reduction factor: {reduction_factor:.2f}")
+        print(f"   Suggested chunk size: {suggested_size}")
+        
+        return suggested_size
+
+    def split_chunk_intelligently(self, chunk_df, target_size: int):
+        """
+        🔪 Split a DataFrame chunk into smaller chunks of target size.
+        
+        Input:
+            chunk_df (polars.DataFrame): The chunk to split
+            target_size (int): Target number of rows per sub-chunk
+        Output:
+            list[polars.DataFrame]: List of smaller chunks
+        """
+        if len(chunk_df) <= target_size:
+            return [chunk_df]
+        
+        chunks = []
+        for i in range(0, len(chunk_df), target_size):
+            sub_chunk = chunk_df[i:i + target_size]
+            chunks.append(sub_chunk)
+        
+        print(f"🔪 Split chunk of {len(chunk_df)} rows into {len(chunks)} sub-chunks of ~{target_size} rows each")
+        return chunks
 
     def ai_api_response(self, contents, system_instructions, current_chunk_size=None):
         """
-        Sends content to the AI model and retrieves the response with token validation.
+        Sends content to the AI model and retrieves the response.
 
         Input:
             contents (str): The input text/data to send to the AI model.
             system_instructions (str): System instructions for the AI model.
-            current_chunk_size (int, optional): Current chunk size for token validation
+            current_chunk_size (int, optional): Current chunk size for token validation (deprecated - handled externally)
         Output:
             str: The text response from the AI model.
-                 Returns None if an error occurs or token limits exceeded.
+                 Returns None if an error occurs.
         Process:
-            1. Validates token count before API call
-            2. Uses the active client (Gemini or Vertex AI) to generate content based on the provided
-               contents and system instructions.
+            Uses the active client (Gemini or Vertex AI) to generate content based on the provided
+            contents and system instructions.
         """
         try:
-            # 🔍 VALIDATE TOKEN COUNT BEFORE API CALL (if chunk size provided)
-            if current_chunk_size is not None:
-                print(f"🔍 Validating token limits before API call...")
-                try:
-                    is_valid = self.validate_content_tokens(contents, current_chunk_size)
-                    if not is_valid:
-                        print(f"❌ Token validation failed")
-                        return None
-                    print(f"✅ Token validation passed")
-                except SystemExit as e:
-                    print(f"🛑 Processing stopped due to token limits")
-                    raise  # Re-raise to stop entire script
-            
             active_client = self.get_client()
             model_name = self.get_model_name()
             
@@ -342,43 +333,26 @@ class data_processing_pipeline:
             )
             ai_response = response.text
             return ai_response
-        except SystemExit:
-            # Re-raise SystemExit to stop processing
-            raise
         except Exception as e:
             print(f"Error: {e}")
             return None
 
     async def ai_api_response_async(self, contents, system_instructions, current_chunk_size=None):
         """
-        Sends content to the AI model and retrieves the response asynchronously with token validation.
+        Sends content to the AI model and retrieves the response asynchronously.
 
         Input:
             contents (str): The input text/data to send to the AI model.
             system_instructions (str): System instructions for the AI model.
-            current_chunk_size (int, optional): Current chunk size for token validation
+            current_chunk_size (int, optional): Current chunk size for token validation (deprecated - handled externally)
         Output:
             str: The text response from the AI model.
-                 Returns None if an error occurs or token limits exceeded.
+                 Returns None if an error occurs.
         Process:
-            1. Validates token count before API call
-            2. Uses the active client's (Gemini or Vertex AI) async interface to generate content based on the provided
-               contents and system instructions.
+            Uses the active client's (Gemini or Vertex AI) async interface to generate content based on the provided
+            contents and system instructions.
         """
         try:
-            # 🔍 VALIDATE TOKEN COUNT BEFORE API CALL (if chunk size provided)
-            if current_chunk_size is not None:
-                print(f"🔍 Validating token limits before API call...")
-                try:
-                    is_valid = self.validate_content_tokens(contents, current_chunk_size)
-                    if not is_valid:
-                        print(f"❌ Token validation failed")
-                        return None
-                    print(f"✅ Token validation passed")
-                except SystemExit as e:
-                    print(f"🛑 Processing stopped due to token limits")
-                    raise  # Re-raise to stop entire script
-            
             active_client = self.get_client()
             model_name = self.get_model_name()
             
@@ -399,9 +373,6 @@ class data_processing_pipeline:
             )
             ai_response = response.text
             return ai_response
-        except SystemExit:
-            # Re-raise SystemExit to stop processing
-            raise
         except Exception as e:
             print(f"Error: {e}")
             return None

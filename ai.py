@@ -10,94 +10,54 @@ import asyncio
 
 # This file contains all the functions used across the project for AI processing
 
-# Load environment variables and setup API client
+# Load environment variables and setup API clients
 load_dotenv()
 api_key = os.getenv('GEMINI_API_KEY')
+vertex_api_key = os.getenv('VERTEX_API_KEY')  # Add Vertex AI API key
+
+# Configuration for API selection
+USE_VERTEX_AI = os.getenv('USE_VERTEX_AI', 'false').lower() == 'true'  # Default to false
+
+# Initialize clients
 client = genai.Client(api_key=api_key)
+vertex_client = genai.Client(vertexai=True, api_key=vertex_api_key) if vertex_api_key else None
 
-#functions created
-
-def convert_to_json_string(material_file):
-    try:
-        material_df = pl.read_excel(material_file)
-        material_df_json = material_df.write_json()
-        material_data = json.loads(material_df_json)
-        material_data = json.dumps(material_data)
-        return material_data
-    except Exception as e:
-        print(f"Error: {e}")
-        return None
+def get_active_client():
+    """
+    Returns the active client based on configuration.
     
-def ai_api_response(contents, system_instructions):
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.0-flash-001',
-            contents=[
-            types.Content(
-                role='user',
-                parts=[{ "text": contents }]  #need to indicate that this is a text for the part. 
-            )
-        ],
-        config=types.GenerateContentConfig(
-            system_instruction=[{ "text": system_instructions }],  # Note: changed from list to string
-            max_output_tokens=100000,
-            temperature=1,
-            response_mime_type="application/json",  # Force JSON output format
-        ),
-        )
-        return response.text
-    except Exception as e:
-        print(f"Error: {e}")
-        return None
+    Output:
+        genai.Client: Either the standard Gemini client or Vertex AI client
+    """
+    if USE_VERTEX_AI and vertex_client:
+        print("Using Vertex AI client")
+        return vertex_client
+    else:
+        print("Using standard Gemini client")
+        return client
 
-async def ai_api_response_async(contents, system_instructions):
-    try:
-        response = await client.aio.models.generate_content(
-            model='gemini-2.0-flash-001',
-            contents=[
-            types.Content(
-                role='user',
-                parts=[{ "text": contents }]  #need to indicate that this is a text for the part. 
-            )
-        ],
-        config=types.GenerateContentConfig(
-            system_instruction=[{ "text": system_instructions }],  # Note: changed from list to string
-            max_output_tokens=100000,
-            temperature=1,
-            response_mime_type="application/json",  # Force JSON output format
-        ),
-        )
-        return response.text
-    except Exception as e:
-        print(f"Error: {e}")
-        return None
+def set_vertex_ai_mode(use_vertex: bool):
+    """
+    Toggle between Vertex AI and standard Gemini API.
     
-def material_response_data_cleansed(): 
-    try:
-        match_start = re.search(r'\[', material_response)
-        match_end = re.search(r'\]', material_response[::-1])
+    Input:
+        use_vertex (bool): True to use Vertex AI, False for standard Gemini
+    """
+    global USE_VERTEX_AI
+    USE_VERTEX_AI = use_vertex
+    print(f"API mode set to: {'Vertex AI' if USE_VERTEX_AI else 'Standard Gemini'}")
 
-        if match_start and match_end:
-            json_start = match_start.start()
-            json_end = len(material_response) - match_end.start()
-            material_response = material_response[json_start:json_end]
-            material_response_str = str(material_response)
-        else:
-            print("No match found")
-        return(material_response_str)
-    except Exception as e:
-        print(f"Error: {e}")
-        return None
+def get_model_name():
+    """
+    Returns the appropriate model name based on the active client.
     
-def material_response_to_excel(material_response_str, path_for_excel):
-    try:
-        material_response_formatted_for_dataframe = json.loads(material_response_str)
-        df_output = pl.DataFrame(material_response_formatted_for_dataframe)
-        df_output_with_int_part_number = df_output.with_columns(pl.col("Part Number").cast(pl.str))
-        df_output_with_int_part_number.write_excel(path_for_excel)
-    except Exception as e:
-        print(f"Error: {e}")
-        return None
+    Output:
+        str: Model name for the active API
+    """
+    if USE_VERTEX_AI:
+        return 'gemini-2.0-flash-001'  # Vertex AI model
+    else:
+        return 'gemini-2.0-flash-001'  # Standard Gemini model
 
 def format_elapsed_time(seconds):
     """
@@ -116,7 +76,7 @@ def format_elapsed_time(seconds):
     return f"Process Time Taken: {minutes} mins {remaining_seconds} s"
 
 class material_checker:
-    def __init__(self, df_material_file, system_instructions, path_for_excel):
+    def __init__(self, df_material_file, system_instructions, path_for_excel, use_vertex_ai=None):
         """
         Initializes the material_checker class.
 
@@ -124,6 +84,7 @@ class material_checker:
             df_material_file (str): Path to the material file (Excel).
             system_instructions (str): System instructions for the AI model.
             path_for_excel (str): Path to save the output Excel file.
+            use_vertex_ai (bool, optional): Override global setting for this instance.
         Output:
             None
         Process:
@@ -132,7 +93,9 @@ class material_checker:
         self.system_instructions = system_instructions
         self.path_for_excel = path_for_excel
         self.df_material_file = df_material_file
+        self.use_vertex_ai = use_vertex_ai if use_vertex_ai is not None else USE_VERTEX_AI
         pass
+
     def convert_to_dataframe(self):
         """
         Converts the material Excel file to a Polars DataFrame.
@@ -151,6 +114,7 @@ class material_checker:
         except Exception as e:
             print(f"Error: {e}")
             return None
+
     def convert_to_json_string(self, material_df):
         """
         Converts a Polars DataFrame to a JSON string.
@@ -173,6 +137,41 @@ class material_checker:
         except Exception as e:
             print(f"Error: {e}")
             return None
+
+    def get_client(self):
+        """
+        Returns the appropriate client for this instance.
+        
+        Output:
+            genai.Client: Either the standard Gemini client or Vertex AI client
+        """
+        if self.use_vertex_ai and vertex_client:
+            return vertex_client
+        else:
+            return client
+
+    def get_model_name(self):
+        """
+        Returns the appropriate model name for this instance.
+        
+        Output:
+            str: Model name for the active API
+        """
+        if self.use_vertex_ai:
+            return 'gemini-2.0-flash-001'  # Vertex AI model
+        else:
+            return 'gemini-2.0-flash-001'  # Standard Gemini model
+
+    def set_vertex_ai_mode(self, use_vertex: bool):
+        """
+        Toggle between Vertex AI and standard Gemini API for this instance.
+        
+        Input:
+            use_vertex (bool): True to use Vertex AI, False for standard Gemini
+        """
+        self.use_vertex_ai = use_vertex
+        print(f"Instance API mode set to: {'Vertex AI' if self.use_vertex_ai else 'Standard Gemini'}")
+
     def ai_api_response(self, contents, system_instructions):
         """
         Sends content to the AI model and retrieves the response.
@@ -184,12 +183,15 @@ class material_checker:
             str: The text response from the AI model.
                  Returns None if an error occurs.
         Process:
-            Uses the genai client to generate content based on the provided
+            Uses the active client (Gemini or Vertex AI) to generate content based on the provided
             contents and system instructions.
         """
         try:
-            response = client.models.generate_content(
-                model='gemini-1.5',
+            active_client = self.get_client()
+            model_name = self.get_model_name()
+            
+            response = active_client.models.generate_content(
+                model=model_name,
                 contents=[
                 types.Content(
                     role='user',
@@ -220,12 +222,15 @@ class material_checker:
             str: The text response from the AI model.
                  Returns None if an error occurs.
         Process:
-            Uses the genai client's async interface to generate content based on the provided
+            Uses the active client's (Gemini or Vertex AI) async interface to generate content based on the provided
             contents and system instructions.
         """
         try:
-            response = await client.aio.models.generate_content(
-                model='gemini-2.0-flash-001',
+            active_client = self.get_client()
+            model_name = self.get_model_name()
+            
+            response = await active_client.aio.models.generate_content(
+                model=model_name,
                 contents=[
                 types.Content(
                     role='user',
@@ -276,6 +281,7 @@ class material_checker:
         except Exception as e:
             print(f"Error: {e}")
             return None
+
     def material_response_data_cleansed(self, material_response):
         """
         Cleans the AI model's response string to extract a valid JSON array.
@@ -325,6 +331,7 @@ class material_checker:
         except Exception as e:
             print(f"Error: {e}")
             return None
+
     def material_response_to_excel(self, df_output_with_int_part_number, path_for_excel):
         """
         Writes a Polars DataFrame to an Excel file.
@@ -342,6 +349,7 @@ class material_checker:
         except Exception as e:
             print(f"Error: {e}")
             return None
+
     def get_versioned_output_path(self, base_dir: str, prefix: str = "Material_Response") -> str:
         """
         Generates a versioned file path for output, creating date-based subfolders.

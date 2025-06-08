@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 # Local imports
 from text_splitter import chunk_polars_dataframe
-from ai import material_checker, format_elapsed_time
+from ai import material_checker, format_elapsed_time, set_vertex_ai_mode
 from prompt import material_system_instruction, dimensions_system_instruction, oryx_processing_instruction
 
 """
@@ -21,21 +21,62 @@ This script processes material data using AI to validate material extraction.
 The complete workflow processes data in chunks with async rate limiting.
 """
 
-# File paths and directory setup
+# =====================================================================
+# CONFIGURATION SECTION - Modify these settings as needed
+# =====================================================================
+
+# 🤖 AI API SELECTION:
+# Set USE_VERTEX_AI to control which API to use:
+# - False = Use Standard Gemini API (DEFAULT - easier setup, good for development)
+# - True  = Use Vertex AI (enterprise features, better rate limits, requires Vertex AI API key)
+USE_VERTEX_AI = False  # 👈 CHANGE THIS: False=Gemini, True=Vertex AI
+
+# 🎯 MODEL SELECTION:
+# Specify which AI model to use regardless of API choice:
+# - "gemini-2.0-flash-001" = Latest Gemini 2.0, best performance (RECOMMENDED)
+# - "gemini-1.5-pro"       = Stable Gemini 1.5 Pro, proven reliability  
+# - "gemini-1.5-flash"     = Faster Gemini 1.5 Flash, cost-effective
+# - "gemini-2.5-flash-preview-05-20" = Preview version (may be unstable)
+MODEL_NAME = "gemini-2.0-flash-001"  # 👈 CHANGE THIS: Specify your preferred model
+
+# 📁 FILE PATHS AND DIRECTORIES:
+# Update these paths to match your local file structure
 material_file = r"C:\Users\pauld\Desktop\Output for Material Check\Material\ConventionalMaterial_individual_result.xlsx"
 dimensions_file = r"C:\Users\pauld\Desktop\Oryx Test\Test.xlsx"
 oryx_file = r"C:\Users\pauld\Desktop\Oryx Test\Test.xlsx"
 
-# Output directories
+# 📂 OUTPUT DIRECTORIES:
+# Specify where processed files should be saved
 dimensions_output_dir = r"C:\Users\pauld\Desktop\Output for Dimensions QC"
 material_output_dir = r"C:\Users\pauld\Desktop\Output for Material Check\Material AI QC"
 oryx_output_dir = r"C:\Users\pauld\Desktop\Oryx Test"
 default_output_dir = r"C:\Users\pauld\Desktop\Output for AI QC"
 
-# Define which prompt to use
-prompt = oryx_processing_instruction
-# Define which file to process
-input_file = dimensions_file
+# 🎯 PROCESSING SELECTION:
+# Choose which prompt and input file to use for processing:
+# Available prompts: material_system_instruction, dimensions_system_instruction, oryx_processing_instruction
+prompt = oryx_processing_instruction  # 👈 CHANGE THIS: Select your prompt
+input_file = dimensions_file  # 👈 CHANGE THIS: Select your input file
+
+# ⚡ RATE LIMITING CONFIGURATION:
+# Controls how fast API requests are sent (to avoid hitting rate limits)
+# Standard Gemini: 4 requests per minute is safe
+# Vertex AI: Can usually handle higher rates, but 4/min is conservative
+REQUESTS_PER_WINDOW = 4  # Number of requests allowed
+TIME_WINDOW = 60  # Time window in seconds (1 minute)
+REQUEST_INTERVAL = TIME_WINDOW / REQUESTS_PER_WINDOW  # Calculated: 15 seconds between requests
+
+# =====================================================================
+# END CONFIGURATION SECTION
+# ⚠️  DO NOT MODIFY ANYTHING BELOW UNLESS YOU KNOW WHAT YOU'RE DOING
+# =====================================================================
+
+# Configure AI API mode
+print(f"=== AI CONFIGURATION ===")
+print(f"Using API: {'Vertex AI' if USE_VERTEX_AI else 'Standard Gemini'}")
+print(f"Model: {MODEL_NAME}")
+set_vertex_ai_mode(USE_VERTEX_AI)
+print("=" * 25)
 
 # Select output directory based on input file
 if input_file == dimensions_file:
@@ -54,16 +95,22 @@ else:
 # Create output directory if it doesn't exist
 os.makedirs(output_dir, exist_ok=True)
 
-# Define rate limit for API requests (4 requests per minute)
-REQUESTS_PER_WINDOW = 4  # requests
-TIME_WINDOW = 60  # seconds (1 minute)
-REQUEST_INTERVAL = TIME_WINDOW / REQUESTS_PER_WINDOW  # 15 seconds between requests
-
 # Create a rate limiter semaphore to control concurrent requests
 rate_limiter = asyncio.Semaphore(REQUESTS_PER_WINDOW)
 
-# Initialize material processor
-material_processer = material_checker(input_file, prompt, output_dir)
+# Initialize material processor with API configuration
+material_processer = material_checker(
+    df_material_file=input_file, 
+    system_instructions=prompt, 
+    path_for_excel=output_dir,
+    use_vertex_ai=USE_VERTEX_AI,  # Pass the API configuration to the processor
+    model_name=MODEL_NAME  # Pass the model name to the processor
+)
+
+print(f"\n=== PROCESSOR CONFIGURATION ===")
+print(f"API Mode: {'Vertex AI' if material_processer.use_vertex_ai else 'Standard Gemini'}")
+print(f"Model: {material_processer.get_model_name()}")
+print("=" * 32)
 
 # Load data into DataFrame
 df = material_processer.convert_to_dataframe()
@@ -101,17 +148,18 @@ async def process_chunk(chunk, material_processer, prompt, chunk_index):
         
         # Convert chunk to JSON
         chunk_json = material_processer.convert_to_json_string(chunk)
-        print(f"Chunk {chunk_index}: JSON prepared")
+        api_type = "Vertex AI" if material_processer.use_vertex_ai else "Gemini"
+        print(f"Chunk {chunk_index}: JSON prepared, using {api_type}")
         
         # Apply rate limiting
         async with rate_limiter:
-            print(f"Chunk {chunk_index}: Sending to AI API...")
+            print(f"Chunk {chunk_index}: Sending to {api_type} API...")
             # Add delay to ensure we don't exceed rate limit
             await asyncio.sleep(REQUEST_INTERVAL)
             
             # Get AI response asynchronously
             material_response = await material_processer.ai_api_response_async(chunk_json, prompt)
-            print(f"Chunk {chunk_index}: API response received")
+            print(f"Chunk {chunk_index}: {api_type} API response received")
         
         # Clean AI response
         material_response_str = material_processer.material_response_data_cleansed(material_response)

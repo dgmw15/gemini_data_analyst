@@ -12,52 +12,67 @@ import asyncio
 
 # Load environment variables and setup API clients
 load_dotenv()
-api_key = os.getenv('GEMINI_API_KEY')
-vertex_api_key = os.getenv('VERTEX_API_KEY')  # Add Vertex AI API key
 
-# Configuration for API selection
-USE_VERTEX_AI = os.getenv('USE_VERTEX_AI', 'false').lower() == 'true'  # Default to false
+# 🔑 API KEYS:
+# Get API keys from environment variables (set in .env file)
+api_key = os.getenv('GEMINI_API_KEY')  # Required: Standard Gemini API key
+vertex_api_key = os.getenv('VERTEX_API_KEY')  # Optional: Vertex AI API key (only needed if using Vertex AI)
 
-# Initialize clients
-client = genai.Client(api_key=api_key)
-vertex_client = genai.Client(vertexai=True, api_key=vertex_api_key) if vertex_api_key else None
+# 🤖 DEFAULT API CONFIGURATION:
+# The system defaults to Standard Gemini API for easier setup and development
+# Change USE_VERTEX_AI in your .env file or run_script.py to switch to Vertex AI
+USE_VERTEX_AI = os.getenv('USE_VERTEX_AI', 'false').lower() == 'true'  # Default: False (uses Gemini)
+
+# 🔌 CLIENT INITIALIZATION:
+# Initialize both clients, but only Vertex AI client if API key is provided
+client = genai.Client(api_key=api_key)  # Standard Gemini client (always available)
+vertex_client = genai.Client(vertexai=True, api_key=vertex_api_key) if vertex_api_key else None  # Vertex AI client (optional)
 
 def get_active_client():
     """
-    Returns the active client based on configuration.
+    🔄 Returns the active client based on current configuration.
+    
+    DEFAULT BEHAVIOR: Returns Standard Gemini client (easier setup)
     
     Output:
         genai.Client: Either the standard Gemini client or Vertex AI client
     """
     if USE_VERTEX_AI and vertex_client:
-        print("Using Vertex AI client")
+        print("✅ Using Vertex AI client")
         return vertex_client
     else:
-        print("Using standard Gemini client")
+        print("✅ Using Standard Gemini client (default)")
         return client
 
 def set_vertex_ai_mode(use_vertex: bool):
     """
-    Toggle between Vertex AI and standard Gemini API.
+    🔀 Toggle between Vertex AI and standard Gemini API globally.
+    
+    DEFAULT: Standard Gemini API (use_vertex=False)
     
     Input:
-        use_vertex (bool): True to use Vertex AI, False for standard Gemini
+        use_vertex (bool): 
+            - False = Use Standard Gemini API (DEFAULT, easier setup)
+            - True  = Use Vertex AI (requires Vertex AI API key)
     """
     global USE_VERTEX_AI
     USE_VERTEX_AI = use_vertex
-    print(f"API mode set to: {'Vertex AI' if USE_VERTEX_AI else 'Standard Gemini'}")
+    api_name = "Vertex AI" if USE_VERTEX_AI else "Standard Gemini (default)"
+    print(f"🔄 Global API mode set to: {api_name}")
 
 def get_model_name():
     """
-    Returns the appropriate model name based on the active client.
+    🎯 Returns the appropriate default model name based on the active client.
+    
+    DEFAULT: gemini-2.0-flash-001 for both APIs
     
     Output:
         str: Model name for the active API
     """
     if USE_VERTEX_AI:
-        return 'gemini-2.0-flash-001'  # Vertex AI model
+        return 'gemini-2.0-flash-001'  # Vertex AI default model
     else:
-        return 'gemini-2.0-flash-001'  # Standard Gemini model
+        return 'gemini-2.0-flash-001'  # Standard Gemini default model (DEFAULT)
 
 def format_elapsed_time(seconds):
     """
@@ -76,24 +91,30 @@ def format_elapsed_time(seconds):
     return f"Process Time Taken: {minutes} mins {remaining_seconds} s"
 
 class material_checker:
-    def __init__(self, df_material_file, system_instructions, path_for_excel, use_vertex_ai=None):
+    def __init__(self, df_material_file, system_instructions, path_for_excel, use_vertex_ai=None, model_name=None):
         """
-        Initializes the material_checker class.
+        🏗️ Initializes the material_checker class.
+
+        DEFAULT BEHAVIOR: Uses Standard Gemini API with gemini-2.0-flash-001 model
 
         Input:
             df_material_file (str): Path to the material file (Excel).
             system_instructions (str): System instructions for the AI model.
             path_for_excel (str): Path to save the output Excel file.
-            use_vertex_ai (bool, optional): Override global setting for this instance.
-        Output:
-            None
-        Process:
-            Sets the initial attributes for the class instance.
+            use_vertex_ai (bool, optional): 
+                - None = Use global setting (DEFAULT)
+                - False = Force Standard Gemini API (easier setup)
+                - True = Force Vertex AI (requires Vertex AI API key)
+            model_name (str, optional): 
+                - None = Use default model (gemini-2.0-flash-001)
+                - Specify custom model (e.g., 'gemini-1.5-pro')
         """
         self.system_instructions = system_instructions
         self.path_for_excel = path_for_excel
         self.df_material_file = df_material_file
+        # Default to global setting (which defaults to Standard Gemini)
         self.use_vertex_ai = use_vertex_ai if use_vertex_ai is not None else USE_VERTEX_AI
+        self.model_name = model_name  # Store custom model name (None = use default)
         pass
 
     def convert_to_dataframe(self):
@@ -140,37 +161,66 @@ class material_checker:
 
     def get_client(self):
         """
-        Returns the appropriate client for this instance.
+        🔌 Returns the appropriate client for this instance.
+        
+        DEFAULT: Returns Standard Gemini client (easier setup)
         
         Output:
             genai.Client: Either the standard Gemini client or Vertex AI client
         """
         if self.use_vertex_ai and vertex_client:
-            return vertex_client
+            return vertex_client  # Use Vertex AI if configured and available
         else:
-            return client
+            return client  # Use Standard Gemini client (DEFAULT)
 
     def get_model_name(self):
         """
-        Returns the appropriate model name for this instance.
+        🎯 Returns the appropriate model name for this instance.
+        
+        DEFAULT: gemini-2.0-flash-001 (recommended for best performance)
         
         Output:
             str: Model name for the active API
         """
+        # If a custom model name is set, use it
+        if self.model_name:
+            return self.model_name
+        
+        # Otherwise use default based on API type (both use same default)
         if self.use_vertex_ai:
-            return 'gemini-2.0-flash-001'  # Vertex AI model
+            return 'gemini-2.0-flash-001'  # Vertex AI default model
         else:
-            return 'gemini-2.0-flash-001'  # Standard Gemini model
+            return 'gemini-2.0-flash-001'  # Standard Gemini default model (DEFAULT)
 
     def set_vertex_ai_mode(self, use_vertex: bool):
         """
-        Toggle between Vertex AI and standard Gemini API for this instance.
+        🔀 Toggle between Vertex AI and standard Gemini API for this instance.
+        
+        DEFAULT: Standard Gemini API (easier setup)
         
         Input:
-            use_vertex (bool): True to use Vertex AI, False for standard Gemini
+            use_vertex (bool): 
+                - False = Use Standard Gemini API (DEFAULT, easier setup)
+                - True = Use Vertex AI (requires Vertex AI API key)
         """
         self.use_vertex_ai = use_vertex
-        print(f"Instance API mode set to: {'Vertex AI' if self.use_vertex_ai else 'Standard Gemini'}")
+        api_name = "Vertex AI" if self.use_vertex_ai else "Standard Gemini (default)"
+        print(f"🔄 Instance API mode set to: {api_name}")
+
+    def set_model_name(self, model_name: str):
+        """
+        🎯 Set a custom model name for this instance.
+        
+        Available models:
+        - 'gemini-2.0-flash-001' (DEFAULT, recommended)
+        - 'gemini-1.5-pro' (stable)
+        - 'gemini-1.5-flash' (faster)
+        
+        Input:
+            model_name (str): The model name to use
+        """
+        self.model_name = model_name
+        print(f"🎯 Model set to: {model_name}")
 
     def ai_api_response(self, contents, system_instructions):
         """

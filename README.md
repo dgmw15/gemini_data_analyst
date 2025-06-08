@@ -1,6 +1,15 @@
 # Gemini Data Analyst
 
-All the basic coding projects I have done for SP3D with Gemini mainly
+This project allow you to process any excel sheets with a single prompt. It has automatic chunking of tokens maintaining within the token window. However, a key item to note, the data is expected to be 1 to 1. (i.e. The data you processed you want the AI to provide the data + any new data for it). As of now, this is not changed until further notice. 
+
+Required changes for usage: 
+1: Create your own prompt
+2: Import the prompt
+3: Change paths for file
+4: Run the script
+
+For future improvement: 
+1: Reduce token output to allow for more data to be processed
 
 ## Setup Instructions
 

@@ -28,6 +28,8 @@ USE_VERTEX_AI = os.getenv('USE_VERTEX_AI', 'false').lower() == 'true'  # Default
 client = genai.Client(api_key=api_key)  # Standard Gemini client (always available)
 vertex_client = genai.Client(vertexai=True, api_key=vertex_api_key) if vertex_api_key else None  # Vertex AI client (optional)
 
+# Token counting functionality is now integrated into the material_checker class methods
+
 def get_active_client():
     """
     🔄 Returns the active client based on current configuration.
@@ -90,15 +92,36 @@ def format_elapsed_time(seconds):
     remaining_seconds = int(seconds % 60)
     return f"Process Time Taken: {minutes} mins {remaining_seconds} s"
 
-class material_checker:
+class data_processing_pipeline:
+    # 🎯 MODEL TOKEN LIMITS - Class-level constants
+    MODEL_TOKEN_LIMITS = {
+        'gemini-2.0-flash-001': 8192,          # Gemini 2.0 Flash
+        'gemini-2.0-flash': 8192,              # Gemini 2.0 Flash (alias)
+        'gemini-2.0-flash-exp': 8192,          # Gemini 2.0 Flash Experimental  
+        'gemini-2.5-pro': 65536,               # Gemini 2.5 Pro (64K tokens)
+        'gemini-2.5-pro-preview-06-05': 65536, # Gemini 2.5 Pro Preview
+        'gemini-2.5-flash': 65536,             # Gemini 2.5 Flash (64K tokens)
+        'gemini-2.5-flash-preview-05-20': 65536, # Gemini 2.5 Flash Preview
+        'gemini-1.5-pro': 8192,                # Gemini 1.5 Pro
+        'gemini-1.5-pro-001': 8192,            # Gemini 1.5 Pro specific version
+        'gemini-1.5-pro-002': 8192,            # Gemini 1.5 Pro specific version
+        'gemini-1.5-flash': 8192,              # Gemini 1.5 Flash
+        'gemini-1.5-flash-001': 8192,          # Gemini 1.5 Flash specific version
+        'gemini-1.5-flash-002': 8192,          # Gemini 1.5 Flash specific version
+        'gemini-1.5-flash-8b': 8192,           # Gemini 1.5 Flash 8B
+    }
+    
     def __init__(self, df_material_file, system_instructions, path_for_excel, use_vertex_ai=None, model_name=None):
         """
-        🏗️ Initializes the material_checker class.
+        🏗️ Initializes the data_processing_pipeline class.
+
+        A comprehensive data processing pipeline with AI integration, token validation, 
+        and automatic rate limiting for scalable data analysis workflows.
 
         DEFAULT BEHAVIOR: Uses Standard Gemini API with gemini-2.0-flash-001 model
 
         Input:
-            df_material_file (str): Path to the material file (Excel).
+            df_material_file (str): Path to the input data file (Excel).
             system_instructions (str): System instructions for the AI model.
             path_for_excel (str): Path to save the output Excel file.
             use_vertex_ai (bool, optional): 
@@ -117,44 +140,471 @@ class material_checker:
         self.model_name = model_name  # Store custom model name (None = use default)
         pass
 
+    def get_model_token_limit(self) -> int:
+        """
+        🎯 Get the output token limit for the current model.
+        
+        Output:
+            int: Maximum output tokens for the model (defaults to 8192 if unknown)
+        """
+        model_name = self.get_model_name()
+        return self.MODEL_TOKEN_LIMITS.get(model_name, 8192)
+
+    def calculate_safe_input_limit(self) -> int:
+        """
+        🛡️ Calculate the safe input token limit (50% of model's output limit).
+        
+        Output:
+            int: Safe input token limit (50% of output tokens)
+        """
+        output_limit = self.get_model_token_limit()
+        safe_limit = int(output_limit * 0.5)
+        model_name = self.get_model_name()
+        print(f"🎯 Model: {model_name}")
+        print(f"📊 Output token limit: {output_limit:,}")
+        print(f"🛡️ Safe input limit (50%): {safe_limit:,}")
+        return safe_limit
+
+    def count_tokens_with_gemini(self, content: str) -> int:
+        """
+        🔢 Count tokens in content using Gemini's SDK.
+        
+        Input:
+            content (str): Text content to count tokens for
+        Output:
+            int: Number of tokens in the content
+            Returns 0 if an error occurs
+        """
+        try:
+            active_client = self.get_client()
+            model_name = self.get_model_name()
+            
+            response = active_client.models.count_tokens(
+                model=model_name,
+                contents=[{
+                    "role": "user",
+                    "parts": [{"text": content}]
+                }]
+            )
+            token_count = response.total_tokens
+            print(f"🔢 Token count: {token_count:,}")
+            return token_count
+        except Exception as e:
+            print(f"❌ Error counting tokens: {e}")
+            return 0
+
+    def validate_token_limit(self, content: str) -> tuple[bool, int, int]:
+        """
+        ✅ Validate that content doesn't exceed safe token limits.
+        
+        Input:
+            content (str): Text content to validate
+        Output:
+            tuple[bool, int, int]: (is_valid, token_count, safe_limit)
+                - is_valid: True if content is within safe limits
+                - token_count: Actual token count of content
+                - safe_limit: Maximum safe token limit
+        """
+        token_count = self.count_tokens_with_gemini(content)
+        safe_limit = self.calculate_safe_input_limit()
+        
+        is_valid = token_count <= safe_limit
+        
+        if is_valid:
+            print(f"✅ Content is within safe limits ({token_count:,}/{safe_limit:,} tokens)")
+        else:
+            print(f"❌ Content exceeds safe limits ({token_count:,}/{safe_limit:,} tokens)")
+            print(f"🚨 Exceeded by: {token_count - safe_limit:,} tokens")
+        
+        return is_valid, token_count, safe_limit
+
+    def stop_processing_due_to_token_limit(self, token_count: int, safe_limit: int, current_chunk_size: int):
+        """
+        🛑 Stop processing and provide guidance when token limits are exceeded.
+        
+        Input:
+            token_count (int): Current token count that exceeded the limit
+            safe_limit (int): Maximum safe token limit
+            current_chunk_size (int): Current chunk size being used
+        Output:
+            None (raises SystemExit to stop execution)
+        """
+        excess_tokens = token_count - safe_limit
+        excess_percentage = (excess_tokens / safe_limit) * 100
+        
+        print("\n" + "="*60)
+        print("🚨 TOKEN LIMIT EXCEEDED - PROCESSING STOPPED")
+        print("="*60)
+        print(f"📊 Current token count: {token_count:,}")
+        print(f"🛡️ Safe token limit: {safe_limit:,}")
+        print(f"⚠️  Excess tokens: {excess_tokens:,} ({excess_percentage:.1f}% over limit)")
+        print(f"📦 Current chunk size: {current_chunk_size} rows")
+        
+        # Suggest new chunk size
+        reduction_factor = token_count / safe_limit
+        suggested_chunk_size = max(1, int(current_chunk_size / reduction_factor * 0.9))  # 90% of calculated size for safety
+        
+        print("\n💡 RECOMMENDED ACTIONS:")
+        print(f"1. Reduce CHUNK_SIZE from {current_chunk_size} to {suggested_chunk_size} rows")
+        print("2. Edit the CHUNK_SIZE variable in your run_script.py configuration section")
+        print("3. Re-run the script with the smaller chunk size")
+        
+        print("\n🔧 CONFIGURATION EDIT:")
+        print(f"   Change: CHUNK_SIZE = {current_chunk_size}")
+        print(f"   To:     CHUNK_SIZE = {suggested_chunk_size}")
+        
+        print("\n📝 ALTERNATIVE OPTIONS:")
+        print("- Use a model with higher token limits")
+        print("- Reduce the amount of data in each row")
+        print("- Process data in smaller batches")
+        print("="*60)
+        
+        raise SystemExit("❌ Processing stopped due to token limit exceeded. Please adjust CHUNK_SIZE and try again.")
+
+    def validate_content_tokens(self, content: str, current_chunk_size: int) -> bool:
+        """
+        🔍 Validate that content doesn't exceed safe token limits before API call.
+        
+        Input:
+            content (str): The content to validate
+            current_chunk_size (int): Current chunk size for error reporting
+        Output:
+            bool: True if content is safe to send, False if it exceeds limits
+        Process:
+            - Counts tokens using Gemini's SDK
+            - Validates against 50% of model's output token limit
+            - Stops processing if limit exceeded
+        """
+        try:
+            print(f"🔍 Validating token count for content...")
+            is_valid, token_count, safe_limit = self.validate_token_limit(content)
+            
+            if not is_valid:
+                self.stop_processing_due_to_token_limit(token_count, safe_limit, current_chunk_size)
+                return False
+            
+            return True
+        except SystemExit:
+            # Re-raise SystemExit to stop processing
+            raise
+        except Exception as e:
+            print(f"⚠️ Warning: Could not validate token count: {e}")
+            print("🔄 Proceeding with API call (token validation failed)")
+            return True
+
+    def ai_api_response(self, contents, system_instructions, current_chunk_size=None):
+        """
+        Sends content to the AI model and retrieves the response with token validation.
+
+        Input:
+            contents (str): The input text/data to send to the AI model.
+            system_instructions (str): System instructions for the AI model.
+            current_chunk_size (int, optional): Current chunk size for token validation
+        Output:
+            str: The text response from the AI model.
+                 Returns None if an error occurs or token limits exceeded.
+        Process:
+            1. Validates token count before API call
+            2. Uses the active client (Gemini or Vertex AI) to generate content based on the provided
+               contents and system instructions.
+        """
+        try:
+            # 🔍 VALIDATE TOKEN COUNT BEFORE API CALL (if chunk size provided)
+            if current_chunk_size is not None:
+                print(f"🔍 Validating token limits before API call...")
+                try:
+                    is_valid = self.validate_content_tokens(contents, current_chunk_size)
+                    if not is_valid:
+                        print(f"❌ Token validation failed")
+                        return None
+                    print(f"✅ Token validation passed")
+                except SystemExit as e:
+                    print(f"🛑 Processing stopped due to token limits")
+                    raise  # Re-raise to stop entire script
+            
+            active_client = self.get_client()
+            model_name = self.get_model_name()
+            
+            response = active_client.models.generate_content(
+                model=model_name,
+                contents=[
+                types.Content(
+                    role='user',
+                    parts=[{ "text": contents }]  #need to indicate that this is a text for the part. 
+                )
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=[{ "text": system_instructions }],  # Note: changed from list to string
+                max_output_tokens=100000,
+                temperature=1,
+                response_mime_type="application/json",  # Force JSON output format
+            ),
+            )
+            ai_response = response.text
+            return ai_response
+        except SystemExit:
+            # Re-raise SystemExit to stop processing
+            raise
+        except Exception as e:
+            print(f"Error: {e}")
+            return None
+
+    async def ai_api_response_async(self, contents, system_instructions, current_chunk_size=None):
+        """
+        Sends content to the AI model and retrieves the response asynchronously with token validation.
+
+        Input:
+            contents (str): The input text/data to send to the AI model.
+            system_instructions (str): System instructions for the AI model.
+            current_chunk_size (int, optional): Current chunk size for token validation
+        Output:
+            str: The text response from the AI model.
+                 Returns None if an error occurs or token limits exceeded.
+        Process:
+            1. Validates token count before API call
+            2. Uses the active client's (Gemini or Vertex AI) async interface to generate content based on the provided
+               contents and system instructions.
+        """
+        try:
+            # 🔍 VALIDATE TOKEN COUNT BEFORE API CALL (if chunk size provided)
+            if current_chunk_size is not None:
+                print(f"🔍 Validating token limits before API call...")
+                try:
+                    is_valid = self.validate_content_tokens(contents, current_chunk_size)
+                    if not is_valid:
+                        print(f"❌ Token validation failed")
+                        return None
+                    print(f"✅ Token validation passed")
+                except SystemExit as e:
+                    print(f"🛑 Processing stopped due to token limits")
+                    raise  # Re-raise to stop entire script
+            
+            active_client = self.get_client()
+            model_name = self.get_model_name()
+            
+            response = await active_client.aio.models.generate_content(
+                model=model_name,
+                contents=[
+                types.Content(
+                    role='user',
+                    parts=[{ "text": contents }]  #need to indicate that this is a text for the part. 
+                )
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=[{ "text": system_instructions }],  # Note: changed from list to string
+                max_output_tokens=100000,
+                temperature=1,
+                response_mime_type="application/json",  # Force JSON output format
+            ),
+            )
+            ai_response = response.text
+            return ai_response
+        except SystemExit:
+            # Re-raise SystemExit to stop processing
+            raise
+        except Exception as e:
+            print(f"Error: {e}")
+            return None
+            
+    def remove_brackets(self, data_df, Column):
+        """
+        Removes specific bracket patterns from a specified column in a DataFrame.
+
+        Input:
+            data_df (polars.DataFrame): The DataFrame to process.
+            Column (str): The name of the column to clean.
+        Output:
+            polars.DataFrame: DataFrame with the specified column cleaned.
+                              Returns None if an error occurs.
+        Process:
+            Replaces "[]" with None.
+            Removes "['" from the start and "']" from the end of strings in the specified column.
+        """
+        try:
+            data_df = data_df.with_columns(
+                pl.when(pl.col(Column).str.strip() == "[]")
+                .then(pl.lit(None))
+                .when(
+                    (pl.col(Column).str.starts_with("['")) & (pl.col(Column).str.ends_with("']"))
+                )
+                .then(
+                    pl.col(Column).str.slice(2, pl.col(Column).str.len() - 3)  # Extract content
+                )
+                .otherwise(pl.col(Column))
+                .alias(Column)
+            )
+            return data_df
+        except Exception as e:
+            print(f"Error: {e}")
+            return None
+
+    def response_data_cleansed(self, ai_response):
+        """
+        Cleans the AI model's response string to extract a valid JSON array.
+
+        Input:
+            ai_response (str): The raw string response from the AI model.
+        Output:
+            str: A string representing a JSON array, extracted from the input.
+                 Returns None if no match is found or an error occurs.
+        Process:
+            Uses regular expressions to find the first '[' and the last ']'
+            to extract the JSON array portion of the string.
+        """
+        try:
+            match_start = re.search(r'\[', ai_response)
+            match_end = re.search(r'\]', ai_response[::-1])
+
+            if match_start and match_end:
+                json_start = match_start.start()
+                json_end = len(ai_response) - match_end.start()
+                ai_response = ai_response[json_start:json_end]
+                ai_response_str = str(ai_response)
+                return ai_response_str
+            else:
+                print("No match found")
+        except Exception as e:
+            print(f"Error: {e}")
+            return None
+        
+    def response_to_dataframe(self, ai_response_str):
+        """
+        Converts a JSON string (presumably a list of objects) to a Polars DataFrame.
+
+        Input:
+            ai_response_str (str): The JSON string to convert.
+        Output:
+            polars.DataFrame: DataFrame created from the JSON string.
+                              Returns None if an error occurs.
+        Process:
+            Loads the JSON string into a Python list of dictionaries,
+            then creates a Polars DataFrame from it.
+        """
+        try:
+            ai_response_formatted_for_dataframe = json.loads(ai_response_str)
+            df_output = pl.DataFrame(ai_response_formatted_for_dataframe)
+            return df_output
+        except Exception as e:
+            print(f"Error: {e}")
+            return None
+
+    def response_to_excel(self, df_output_with_processed_data, path_for_excel):
+        """
+        Writes a Polars DataFrame to an Excel file.
+
+        Input:
+            df_output_with_processed_data (polars.DataFrame): The DataFrame to write.
+            path_for_excel (str): The file path to save the Excel file.
+        Output:
+            None
+        Process:
+            Writes the given DataFrame to an Excel file at the specified path.
+        """
+        try:
+            df_output_with_processed_data.write_excel(path_for_excel)
+        except Exception as e:
+            print(f"Error: {e}")
+            return None
+
+    def get_versioned_output_path(self, base_dir: str, prefix: str = "Data_Response") -> str:
+        """
+        Generates a versioned file path for output, creating date-based subfolders.
+
+        Input:
+            base_dir (str): The base directory where the output will be stored.
+            prefix (str, optional): Prefix for the output file name.
+                                    Defaults to "Data_Response".
+        Output:
+            str: A unique, versioned file path (e.g., "base_dir/Results_YYYYMMDD/Prefix_YYYYMMDD_HHMM_vN.xlsx").
+        Process:
+            1. Creates a subfolder named "Results_YYYYMMDD" inside `base_dir` if it doesn't exist.
+            2. Constructs an initial file name using the prefix and current timestamp (YYYYMMDD_HHMM).
+            3. If the file already exists, appends a version number (e.g., "_v1", "_v2")
+               until a unique file name is found.
+        """
+        # Create a subfolder with current date
+        current_date = datetime.datetime.now().strftime("%Y%m%d")
+        current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        
+        # Create subfolder
+        subfolder = os.path.join(base_dir, f"Results_{current_date}")
+        os.makedirs(subfolder, exist_ok=True)
+        
+        # Create initial base path
+        base_path = os.path.join(subfolder, f"{prefix}_{current_time}.xlsx")
+        
+        # If base path doesn't exist, return it
+        if not os.path.exists(base_path):
+            return base_path
+        
+        # If base path exists, create versioned name
+        version = 1
+        versioned_path = os.path.join(subfolder, f"{prefix}_{current_time}_v{version}.xlsx")
+        
+        while os.path.exists(versioned_path):
+            version += 1
+            versioned_path = os.path.join(subfolder, f"{prefix}_{current_time}_v{version}.xlsx")
+        
+        return versioned_path
+    
+    def imposed_string_format(self, df_output):
+        """
+        Casts all columns in a Polars DataFrame to string type.
+
+        Input:
+            df_output (polars.DataFrame): The DataFrame to process.
+        Output:
+            polars.DataFrame: DataFrame with all columns cast to string type.
+                              Returns None if an error occurs.
+        Process:
+            Uses Polars' `with_columns` and `cast(pl.String)` to convert
+            every column in the DataFrame to the string data type.
+        """
+        try:
+            df_output = df_output.with_columns(pl.all().cast(pl.String))
+            return df_output
+        except Exception as e:
+            print(f"Error: {e}")
+            return None
+
     def convert_to_dataframe(self):
         """
-        Converts the material Excel file to a Polars DataFrame.
+        Converts the input Excel file to a Polars DataFrame.
 
         Input:
             None (uses self.df_material_file initialized in __init__)
         Output:
-            polars.DataFrame: DataFrame representation of the material file.
+            polars.DataFrame: DataFrame representation of the input file.
                               Returns None if an error occurs.
         Process:
             Reads the Excel file specified by self.df_material_file into a Polars DataFrame.
         """
         try:
-            material_df = pl.read_excel(self.df_material_file)
-            return material_df
+            data_df = pl.read_excel(self.df_material_file)
+            return data_df
         except Exception as e:
             print(f"Error: {e}")
             return None
 
-    def convert_to_json_string(self, material_df):
+    def convert_to_json_string(self, data_df):
         """
         Converts a Polars DataFrame to a JSON string.
 
         Input:
-            material_df (polars.DataFrame): The DataFrame to convert.
+            data_df (polars.DataFrame): The DataFrame to convert.
         Output:
             str: JSON string representation of the DataFrame.
                  Returns None if an error occurs.
         Process:
             Writes the DataFrame to a JSON string, then loads and dumps it
-            to ensure correct formatting. Stores the result in self.material_data.
+            to ensure correct formatting. Stores the result in self.data_content.
         """
         try:
-            material_df_json = material_df.write_json()
-            material_data = json.loads(material_df_json)
-            material_data = json.dumps(material_data)
-            self.material_data = material_data
-            return self.material_data
+            data_df_json = data_df.write_json()
+            data_content = json.loads(data_df_json)
+            data_content = json.dumps(data_content)
+            self.data_content = data_content
+            return self.data_content
         except Exception as e:
             print(f"Error: {e}")
             return None
@@ -221,245 +671,6 @@ class material_checker:
         """
         self.model_name = model_name
         print(f"🎯 Model set to: {model_name}")
-
-    def ai_api_response(self, contents, system_instructions):
-        """
-        Sends content to the AI model and retrieves the response.
-
-        Input:
-            contents (str): The input text/data to send to the AI model.
-            system_instructions (str): System instructions for the AI model.
-        Output:
-            str: The text response from the AI model.
-                 Returns None if an error occurs.
-        Process:
-            Uses the active client (Gemini or Vertex AI) to generate content based on the provided
-            contents and system instructions.
-        """
-        try:
-            active_client = self.get_client()
-            model_name = self.get_model_name()
-            
-            response = active_client.models.generate_content(
-                model=model_name,
-                contents=[
-                types.Content(
-                    role='user',
-                    parts=[{ "text": contents }]  #need to indicate that this is a text for the part. 
-                )
-            ],
-            config=types.GenerateContentConfig(
-                system_instruction=[{ "text": system_instructions }],  # Note: changed from list to string
-                max_output_tokens=100000,
-                temperature=1,
-                response_mime_type="application/json",  # Force JSON output format
-            ),
-            )
-            material_response = response.text
-            return material_response
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-
-    async def ai_api_response_async(self, contents, system_instructions):
-        """
-        Sends content to the AI model and retrieves the response asynchronously.
-
-        Input:
-            contents (str): The input text/data to send to the AI model.
-            system_instructions (str): System instructions for the AI model.
-        Output:
-            str: The text response from the AI model.
-                 Returns None if an error occurs.
-        Process:
-            Uses the active client's (Gemini or Vertex AI) async interface to generate content based on the provided
-            contents and system instructions.
-        """
-        try:
-            active_client = self.get_client()
-            model_name = self.get_model_name()
-            
-            response = await active_client.aio.models.generate_content(
-                model=model_name,
-                contents=[
-                types.Content(
-                    role='user',
-                    parts=[{ "text": contents }]  #need to indicate that this is a text for the part. 
-                )
-            ],
-            config=types.GenerateContentConfig(
-                system_instruction=[{ "text": system_instructions }],  # Note: changed from list to string
-                max_output_tokens=100000,
-                temperature=1,
-                response_mime_type="application/json",  # Force JSON output format
-            ),
-            )
-            material_response = response.text
-            return material_response
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-            
-    def material_remove_brackets(self, material_df, Column):
-        """
-        Removes specific bracket patterns from a specified column in a DataFrame.
-
-        Input:
-            material_df (polars.DataFrame): The DataFrame to process.
-            Column (str): The name of the column to clean.
-        Output:
-            polars.DataFrame: DataFrame with the specified column cleaned.
-                              Returns None if an error occurs.
-        Process:
-            Replaces "[]" with None.
-            Removes "['" from the start and "']" from the end of strings in the specified column.
-        """
-        try:
-            material_df = material_df.with_columns(
-                pl.when(pl.col(Column).str.strip() == "[]")
-                .then(pl.lit(None))
-                .when(
-                    (pl.col(Column).str.starts_with("['")) & (pl.col(Column).str.ends_with("']"))
-                )
-                .then(
-                    pl.col(Column).str.slice(2, pl.col(Column).str.len() - 3)  # Extract content
-                )
-                .otherwise(pl.col(Column))
-                .alias(Column)
-            )
-            return material_df
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-
-    def material_response_data_cleansed(self, material_response):
-        """
-        Cleans the AI model's response string to extract a valid JSON array.
-
-        Input:
-            material_response (str): The raw string response from the AI model.
-        Output:
-            str: A string representing a JSON array, extracted from the input.
-                 Returns None if no match is found or an error occurs.
-        Process:
-            Uses regular expressions to find the first '[' and the last ']'
-            to extract the JSON array portion of the string.
-        """
-        try:
-            match_start = re.search(r'\[', material_response)
-            match_end = re.search(r'\]', material_response[::-1])
-
-            if match_start and match_end:
-                json_start = match_start.start()
-                json_end = len(material_response) - match_end.start()
-                material_response = material_response[json_start:json_end]
-                material_response_str = str(material_response)
-                return material_response_str
-            else:
-                print("No match found")
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-        
-    def material_response_to_dataframe(self, material_response_str):
-        """
-        Converts a JSON string (presumably a list of objects) to a Polars DataFrame.
-
-        Input:
-            material_response_str (str): The JSON string to convert.
-        Output:
-            polars.DataFrame: DataFrame created from the JSON string.
-                              Returns None if an error occurs.
-        Process:
-            Loads the JSON string into a Python list of dictionaries,
-            then creates a Polars DataFrame from it.
-        """
-        try:
-            material_response_formatted_for_dataframe = json.loads(material_response_str)
-            df_output = pl.DataFrame(material_response_formatted_for_dataframe)
-            return df_output
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-
-    def material_response_to_excel(self, df_output_with_int_part_number, path_for_excel):
-        """
-        Writes a Polars DataFrame to an Excel file.
-
-        Input:
-            df_output_with_int_part_number (polars.DataFrame): The DataFrame to write.
-            path_for_excel (str): The file path to save the Excel file.
-        Output:
-            None
-        Process:
-            Writes the given DataFrame to an Excel file at the specified path.
-        """
-        try:
-            df_output_with_int_part_number.write_excel(path_for_excel)
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-
-    def get_versioned_output_path(self, base_dir: str, prefix: str = "Material_Response") -> str:
-        """
-        Generates a versioned file path for output, creating date-based subfolders.
-
-        Input:
-            base_dir (str): The base directory where the output will be stored.
-            prefix (str, optional): Prefix for the output file name.
-                                    Defaults to "Material_Response".
-        Output:
-            str: A unique, versioned file path (e.g., "base_dir/Results_YYYYMMDD/Prefix_YYYYMMDD_HHMM_vN.xlsx").
-        Process:
-            1. Creates a subfolder named "Results_YYYYMMDD" inside `base_dir` if it doesn't exist.
-            2. Constructs an initial file name using the prefix and current timestamp (YYYYMMDD_HHMM).
-            3. If the file already exists, appends a version number (e.g., "_v1", "_v2")
-               until a unique file name is found.
-        """
-        # Create a subfolder with current date
-        current_date = datetime.datetime.now().strftime("%Y%m%d")
-        current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-        
-        # Create subfolder
-        subfolder = os.path.join(base_dir, f"Results_{current_date}")
-        os.makedirs(subfolder, exist_ok=True)
-        
-        # Create initial base path
-        base_path = os.path.join(subfolder, f"{prefix}_{current_time}.xlsx")
-        
-        # If base path doesn't exist, return it
-        if not os.path.exists(base_path):
-            return base_path
-        
-        # If base path exists, create versioned name
-        version = 1
-        versioned_path = os.path.join(subfolder, f"{prefix}_{current_time}_v{version}.xlsx")
-        
-        while os.path.exists(versioned_path):
-            version += 1
-            versioned_path = os.path.join(subfolder, f"{prefix}_{current_time}_v{version}.xlsx")
-        
-        return versioned_path
-    
-    def imposed_string_format(self, df_output):
-        """
-        Casts all columns in a Polars DataFrame to string type.
-
-        Input:
-            df_output (polars.DataFrame): The DataFrame to process.
-        Output:
-            polars.DataFrame: DataFrame with all columns cast to string type.
-                              Returns None if an error occurs.
-        Process:
-            Uses Polars' `with_columns` and `cast(pl.String)` to convert
-            every column in the DataFrame to the string data type.
-        """
-        try:
-            df_output = df_output.with_columns(pl.all().cast(pl.String))
-            return df_output
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
 
 
 

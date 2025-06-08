@@ -11,13 +11,13 @@ from tqdm import tqdm
 
 # Local imports
 from text_splitter import chunk_polars_dataframe
-from ai import material_checker, format_elapsed_time, set_vertex_ai_mode
+from ai import data_processing_pipeline, format_elapsed_time, set_vertex_ai_mode
 from prompt import material_system_instruction, dimensions_system_instruction, oryx_processing_instruction
 
 """
-Material Checker Process Documentation
+Data Processing Pipeline Documentation
 
-This script processes material data using AI to validate material extraction.
+This script processes data using AI to validate and analyze content.
 The complete workflow processes data in chunks with async rate limiting.
 """
 
@@ -66,6 +66,12 @@ REQUESTS_PER_WINDOW = 4  # Number of requests allowed
 TIME_WINDOW = 60  # Time window in seconds (1 minute)
 REQUEST_INTERVAL = TIME_WINDOW / REQUESTS_PER_WINDOW  # Calculated: 15 seconds between requests
 
+# 📊 DATA PROCESSING CONFIGURATION:
+# Controls how data is split into chunks for processing
+CHUNK_SIZE = 15  # 👈 CHANGE THIS: Number of rows per chunk (default: 15)
+                 # Smaller chunks = more API calls but faster individual processing
+                 # Larger chunks = fewer API calls but slower individual processing
+
 # =====================================================================
 # END CONFIGURATION SECTION
 # ⚠️  DO NOT MODIFY ANYTHING BELOW UNLESS YOU KNOW WHAT YOU'RE DOING
@@ -98,8 +104,8 @@ os.makedirs(output_dir, exist_ok=True)
 # Create a rate limiter semaphore to control concurrent requests
 rate_limiter = asyncio.Semaphore(REQUESTS_PER_WINDOW)
 
-# Initialize material processor with API configuration
-material_processer = material_checker(
+# Initialize data processor with API configuration
+data_processor = data_processing_pipeline(
     df_material_file=input_file, 
     system_instructions=prompt, 
     path_for_excel=output_dir,
@@ -108,38 +114,39 @@ material_processer = material_checker(
 )
 
 print(f"\n=== PROCESSOR CONFIGURATION ===")
-print(f"API Mode: {'Vertex AI' if material_processer.use_vertex_ai else 'Standard Gemini'}")
-print(f"Model: {material_processer.get_model_name()}")
+print(f"API Mode: {'Vertex AI' if data_processor.use_vertex_ai else 'Standard Gemini'}")
+print(f"Model: {data_processor.get_model_name()}")
 print("=" * 32)
 
 # Load data into DataFrame
-df = material_processer.convert_to_dataframe()
+df = data_processor.convert_to_dataframe()
 print(f"Loaded DataFrame with shape: {df.shape}")
 print("\n=== INITIAL DATAFRAME ===")
 print(df)
 print("=========================\n")
 
 # Convert DataFrame to JSON for verification
-chunk_json = material_processer.convert_to_json_string(df)
+chunk_json = data_processor.convert_to_json_string(df)
 print("DataFrame converted to JSON format")
 
 # Split data into manageable chunks
-df_chunks = chunk_polars_dataframe(df, 15)
+df_chunks = chunk_polars_dataframe(df, CHUNK_SIZE)
 print(f"Data split into {len(df_chunks)} chunks")
 
-async def process_chunk(chunk, material_processer, prompt, chunk_index):
+async def process_chunk(chunk, data_processor, prompt, chunk_index):
     """
-    Process a single chunk asynchronously with rate limiting.
+    Process a single chunk asynchronously with rate limiting and token validation.
     
     Input:
         chunk: DataFrame chunk with rows
-        material_processer: Instance of material_checker
+        data_processor: Instance of data_processing_pipeline
         prompt: System instructions for the AI
         chunk_index: Index of the chunk for logging
     Output:
         processed_df: DataFrame with validation results
     Process:
         - Converts the chunk to JSON
+        - Validates token count before API call
         - Sends to AI model asynchronously with rate limiting
         - Cleans response and converts back to DataFrame
     """
@@ -147,8 +154,8 @@ async def process_chunk(chunk, material_processer, prompt, chunk_index):
         chunk_start_time = time.time()
         
         # Convert chunk to JSON
-        chunk_json = material_processer.convert_to_json_string(chunk)
-        api_type = "Vertex AI" if material_processer.use_vertex_ai else "Gemini"
+        chunk_json = data_processor.convert_to_json_string(chunk)
+        api_type = "Vertex AI" if data_processor.use_vertex_ai else "Gemini"
         print(f"Chunk {chunk_index}: JSON prepared, using {api_type}")
         
         # Apply rate limiting
@@ -157,19 +164,19 @@ async def process_chunk(chunk, material_processer, prompt, chunk_index):
             # Add delay to ensure we don't exceed rate limit
             await asyncio.sleep(REQUEST_INTERVAL)
             
-            # Get AI response asynchronously
-            material_response = await material_processer.ai_api_response_async(chunk_json, prompt)
+            # Get AI response asynchronously (includes automatic token validation)
+            ai_response = await data_processor.ai_api_response_async(chunk_json, prompt, CHUNK_SIZE)
             print(f"Chunk {chunk_index}: {api_type} API response received")
         
         # Clean AI response
-        material_response_str = material_processer.material_response_data_cleansed(material_response)
+        ai_response_str = data_processor.response_data_cleansed(ai_response)
         
         # Convert JSON response to DataFrame
-        json_output = json.loads(material_response_str)
+        json_output = json.loads(ai_response_str)
         df_output = pl.DataFrame(json_output)
 
         # Format DataFrame types
-        df_output = material_processer.imposed_string_format(df_output)
+        df_output = data_processor.imposed_string_format(df_output)
         
         # Calculate and display chunk processing time
         chunk_end_time = time.time()
@@ -178,17 +185,20 @@ async def process_chunk(chunk, material_processer, prompt, chunk_index):
         print(f"Chunk {chunk_index}: Processed DataFrame shape: {df_output.shape}")
         
         return df_output
+    except SystemExit:
+        # Re-raise SystemExit to stop processing
+        raise
     except Exception as e:
         print(f"Error processing chunk {chunk_index}: {e}")
         return None
 
-async def process_all_chunks(df_chunks, material_processer, prompt):
+async def process_all_chunks(df_chunks, data_processor, prompt):
     """
     Process all chunks asynchronously with rate limiting.
     
     Input:
         df_chunks: List of DataFrame chunks
-        material_processer: Instance of material_checker
+        data_processor: Instance of data_processing_pipeline
         prompt: System instructions for the AI
     Output:
         all_processed_dfs: List of processed DataFrames
@@ -201,7 +211,7 @@ async def process_all_chunks(df_chunks, material_processer, prompt):
     tasks = []
     for i, chunk in enumerate(df_chunks):
         task = asyncio.create_task(
-            process_chunk(chunk, material_processer, prompt, i)
+            process_chunk(chunk, data_processor, prompt, i)
         )
         tasks.append(task)
     
@@ -232,7 +242,7 @@ async def main():
         start_time = time.time()
         
         # Process all chunks
-        all_processed_dfs = await process_all_chunks(df_chunks, material_processer, prompt)
+        all_processed_dfs = await process_all_chunks(df_chunks, data_processor, prompt)
         
         # Calculate and display total processing time
         end_time = time.time()
@@ -243,8 +253,8 @@ async def main():
             combined_df = pl.concat(all_processed_dfs, how="vertical")
             print(f"Final combined DataFrame shape: {combined_df.shape}")
             
-            output_path = material_processer.get_versioned_output_path(output_dir, prefix=output_prefix)
-            material_processer.material_response_to_excel(combined_df, output_path)
+            output_path = data_processor.get_versioned_output_path(output_dir, prefix=output_prefix)
+            data_processor.response_to_excel(combined_df, output_path)
             print(f"Successfully wrote to Excel: {output_path}")
         else:
             print("No DataFrames to combine")
